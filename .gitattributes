@@ -1,4 +1,3 @@
-/references/ouroboros export-ignore
-/references/gajae-code export-ignore
+/references/ export-ignore
 /.gitmodules export-ignore
 /.gitattributes export-ignore
