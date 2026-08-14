@@ -1,0 +1,6 @@
+[submodule "references/ouroboros"]
+	path = references/ouroboros
+	url = https://github.com/Q00/ouroboros.git
+[submodule "references/gajae-code"]
+	path = references/gajae-code
+	url = https://github.com/Yeachan-Heo/gajae-code.git
