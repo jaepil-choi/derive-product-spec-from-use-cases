@@ -1,0 +1,4 @@
+interface:
+  display_name: "Derive Product Spec from Use Cases"
+  short_description: "Turn use cases into a validated product specification"
+  default_prompt: "Use $derive-product-spec-from-use-cases to turn my vague product concept into validated use cases, a PRD, and an architecture."
