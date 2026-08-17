@@ -1,0 +1,936 @@
+/**
+ * Update CLI command handler.
+ *
+ * Handles `gjc update` to check for and install updates.
+ * Uses bun if available, otherwise downloads binary from GitHub releases.
+ */
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { pipeline } from "node:stream/promises";
+import { $which, APP_NAME, isEnoent, VERSION } from "@gajae-code/utils";
+import { $ } from "bun";
+import chalk from "chalk";
+import { distTagForChannel, isUpdateChannel, UPDATE_CHANNELS, type UpdateChannel } from "../config/update-channel";
+import { installDefaultGjcDefinitions } from "../defaults/gjc-defaults";
+import { theme } from "../modes/theme/theme";
+import {
+	DEFAULT_NPM_REGISTRY,
+	fetchLatestPackageVersion,
+	type Installer,
+	type NpmRegistryLookupOptions,
+} from "../utils/npm-registry";
+
+const RELEASE_REPO = "Yeachan-Heo/gajae-code";
+const PACKAGE = "@gajae-code/coding-agent";
+const NPM_WRAPPER_PACKAGE = "gajae-code";
+const NPM_MANAGED_PACKAGES = [NPM_WRAPPER_PACKAGE, PACKAGE] as const;
+
+export interface UpdateCommandOptions {
+	force: boolean;
+	check: boolean;
+	channel?: UpdateChannel;
+}
+
+interface ReleaseInfo {
+	tag: string;
+	version: string;
+	/** Registry the version came from. Release binaries still come from GitHub. */
+	registry: string;
+	/** Config problems that did not stop the lookup but changed its outcome. */
+	warnings: string[];
+}
+
+/** Result from running the installed binary and parsing its reported version. */
+export interface InstalledVersionVerification {
+	ok: boolean;
+	actual?: string;
+	path?: string;
+	smokeTestFailed?: boolean;
+	smokeTestOutput?: string;
+	cleanupWarning?: string;
+}
+
+export interface PackageManagerUpdateResult {
+	exitCode: number | null;
+	text: () => string;
+}
+
+export type PackageManagerUpdateRunner = (expectedVersion: string) => Promise<PackageManagerUpdateResult>;
+
+export interface PackageManagerUpdateOptions {
+	managerName: string;
+	expectedVersion: string;
+	runInstall: PackageManagerUpdateRunner;
+	verifyInstalledRuntime: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+	printRecoveredVerification?: (expectedVersion: string) => void;
+}
+
+/** Paths and verifier used while replacing a downloaded binary update. */
+export interface BinaryReplacementOptions {
+	targetPath: string;
+	tempPath: string;
+	backupPath: string;
+	expectedVersion: string;
+	verifyInstalledVersion: (expectedVersion: string) => Promise<InstalledVersionVerification>;
+}
+
+/**
+ * Parse update subcommand arguments.
+ * Returns undefined if not an update command.
+ */
+export function parseUpdateArgs(args: string[]): UpdateCommandOptions | undefined {
+	if (args.length === 0 || args[0] !== "update") {
+		return undefined;
+	}
+
+	let channel: UpdateChannel | undefined;
+	for (let i = 1; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--channel" && i + 1 >= args.length) {
+			throw new Error(`Missing value for --channel. Expected one of: ${UPDATE_CHANNELS.join(", ")}.`);
+		}
+		const value =
+			arg === "--channel" ? args[++i] : arg.startsWith("--channel=") ? arg.slice("--channel=".length) : undefined;
+		if (value === undefined) continue;
+		if (!isUpdateChannel(value)) {
+			throw new Error(`Invalid --channel "${value}". Expected one of: ${UPDATE_CHANNELS.join(", ")}.`);
+		}
+		channel = value;
+	}
+
+	return {
+		force: args.includes("--force") || args.includes("-f"),
+		check: args.includes("--check") || args.includes("-c"),
+		...(channel ? { channel } : {}),
+	};
+}
+
+async function getBunGlobalBinDir(): Promise<string | undefined> {
+	if (!$which("bun")) return undefined;
+	try {
+		const result = await $`bun pm bin -g`.quiet().nothrow();
+		if (result.exitCode !== 0) return undefined;
+		const output = result.text().trim();
+		return output.length > 0 ? output : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function normalizePathForComparison(filePath: string): string {
+	const normalized = path.normalize(filePath);
+	if (process.platform === "win32") return normalized.toLowerCase();
+	return normalized;
+}
+
+function tryRealpath(p: string): string | undefined {
+	try {
+		return fs.realpathSync.native(p);
+	} catch {
+		return undefined;
+	}
+}
+
+function isPathInDirectoryLexical(filePath: string, directoryPath: string): boolean {
+	const normalizedPath = normalizePathForComparison(path.resolve(filePath));
+	const normalizedDirectory = normalizePathForComparison(path.resolve(directoryPath));
+	const relativePath = path.relative(normalizedDirectory, normalizedPath);
+	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function isPathInDirectory(filePath: string, directoryPath: string): boolean {
+	if (isPathInDirectoryLexical(filePath, directoryPath)) return true;
+	// Layer realpath resolution on top of the lexical guard. On Windows, ~/.bun
+	// is a junction when Bun is installed via Scoop, so `bun pm bin -g` and the
+	// PATH-resolved gjc path can refer to the same directory through different
+	// strings. path.resolve does not traverse junctions/symlinks; realpath does.
+	// Resolve the file's parent directory to tolerate the file itself not yet
+	// existing (e.g. a fresh install path) while still catching link-traversed
+	// equality once the directory exists.
+	const fileDir = tryRealpath(path.dirname(path.resolve(filePath)));
+	const dirReal = tryRealpath(path.resolve(directoryPath));
+	if (!fileDir || !dirReal) return false;
+	const resolvedFile = path.join(fileDir, path.basename(filePath));
+	return isPathInDirectoryLexical(resolvedFile, dirReal);
+}
+
+export type PackageManagerTarget = { manager: "npm"; packageName: string };
+export type UpdateTarget =
+	| { method: "bun" }
+	| { method: "npm"; packageName: string }
+	| { method: "binary"; path: string };
+
+type PathPlatform = NodeJS.Platform;
+type PackageExists = (packageName: string, packageRoot: string) => boolean;
+
+function pathApiForPlatform(platform: PathPlatform): typeof path.posix | typeof path.win32 {
+	return platform === "win32" ? path.win32 : path.posix;
+}
+
+function defaultPackageExists(_packageName: string, packageRoot: string): boolean {
+	return fs.existsSync(path.join(packageRoot, "package.json"));
+}
+
+function npmPackageRootForBinPath(binPath: string, packageName: string, platform: PathPlatform): string {
+	const pathApi = pathApiForPlatform(platform);
+	const segments = packageName.split("/");
+	return pathApi.join(pathApi.dirname(binPath), "node_modules", ...segments);
+}
+
+function resolveNpmManagedTarget(
+	ompPath: string,
+	platform: PathPlatform = process.platform,
+	packageExists: PackageExists = defaultPackageExists,
+): PackageManagerTarget | undefined {
+	if (platform !== "win32") return undefined;
+	const pathApi = pathApiForPlatform(platform);
+	const extension = pathApi.extname(ompPath).toLowerCase();
+	if (extension !== ".cmd" && extension !== ".ps1") return undefined;
+	const basename = pathApi.basename(ompPath, extension).toLowerCase();
+	if (basename !== APP_NAME.toLowerCase()) return undefined;
+
+	for (const packageName of NPM_MANAGED_PACKAGES) {
+		const packageRoot = npmPackageRootForBinPath(ompPath, packageName, platform);
+		if (packageExists(packageName, packageRoot)) return { manager: "npm", packageName };
+	}
+	return undefined;
+}
+
+function resolveUpdateMethod(ompPath: string, bunBinDir: string | undefined): "bun" | "npm" | "binary" {
+	if (resolveNpmManagedTarget(ompPath)) return "npm";
+	if (!bunBinDir) return "binary";
+	return isPathInDirectory(ompPath, bunBinDir) ? "bun" : "binary";
+}
+
+export function resolveUpdateMethodForTest(ompPath: string, bunBinDir: string | undefined): "bun" | "npm" | "binary" {
+	return resolveUpdateMethod(ompPath, bunBinDir);
+}
+
+export function resolveNpmManagedTargetForTest(
+	ompPath: string,
+	platform: PathPlatform,
+	packageExists: PackageExists,
+): PackageManagerTarget | undefined {
+	return resolveNpmManagedTarget(ompPath, platform, packageExists);
+}
+async function resolveUpdateTarget(): Promise<UpdateTarget> {
+	const bunBinDir = await getBunGlobalBinDir();
+	const ompPath = resolveGjcPath();
+
+	if (ompPath) {
+		const npmTarget = resolveNpmManagedTarget(ompPath);
+		if (npmTarget) return { method: "npm", packageName: npmTarget.packageName };
+		const method = resolveUpdateMethod(ompPath, bunBinDir);
+		if (method === "bun") return { method };
+		if (method === "npm") {
+			throw new Error(
+				formatUnsupportedTargetMessage(`Could not resolve npm package root for ${APP_NAME} shim ${ompPath}`),
+			);
+		}
+		return { method, path: ompPath };
+	}
+
+	if (bunBinDir) return { method: "bun" };
+
+	throw new Error(formatUnsupportedTargetMessage(`Could not resolve ${APP_NAME} binary path in PATH`));
+}
+
+/** Lookup options for the release check: registry resolution plus the release channel. */
+export interface LatestReleaseLookupOptions extends NpmRegistryLookupOptions {
+	channel?: UpdateChannel;
+}
+
+/**
+ * Get the latest release info for a channel from the npm registry.
+ * Uses npm instead of GitHub API to avoid unauthenticated rate limiting.
+ *
+ * The registry comes from npm config (`npm_config_registry`, `.npmrc`,
+ * `BUN_CONFIG_REGISTRY`) so the check reaches the same place the install does.
+ * Hardcoding the public registry broke every mirrored or firewalled network.
+ */
+async function getLatestRelease(options?: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
+	const { channel = "stable", ...lookupOptions } = options ?? {};
+	// The user is deliberately waiting on this command, unlike the startup check.
+	let version: string;
+	let registry: string;
+	let warnings: string[];
+	try {
+		({ version, registry, warnings } = await fetchLatestPackageVersion(PACKAGE, {
+			timeoutMs: 20_000,
+			...lookupOptions,
+			distTag: distTagForChannel(channel),
+		}));
+	} catch (err) {
+		if (channel === "nightly") {
+			throw new Error(
+				`${err instanceof Error ? err.message : String(err)} The nightly channel has no published release yet; it is populated by the scheduled nightly workflow.`,
+			);
+		}
+		throw err;
+	}
+
+	return {
+		tag: `v${version}`,
+		version,
+		registry,
+		warnings,
+	};
+}
+
+export function getLatestReleaseForTest(options: LatestReleaseLookupOptions): Promise<ReleaseInfo> {
+	return getLatestRelease(options);
+}
+
+/**
+ * Compare semver versions (including nightly prereleases). Returns:
+ * - negative if a < b
+ * - 0 if a == b
+ * - positive if a > b
+ */
+function compareVersions(a: string, b: string): number {
+	return Bun.semver.order(a, b);
+}
+
+export function compareVersionsForTest(a: string, b: string): number {
+	return compareVersions(a, b);
+}
+
+/**
+ * Get the appropriate binary name for this platform.
+ */
+function getBinaryName(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
+	let os: string;
+	switch (platform) {
+		case "linux":
+			os = "linux";
+			break;
+		case "darwin":
+			os = "darwin";
+			break;
+		case "win32":
+			os = "windows";
+			break;
+		default:
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported platform: ${platform}`));
+	}
+
+	let archName: string;
+	switch (arch) {
+		case "x64":
+			archName = "x64";
+			break;
+		case "arm64":
+			archName = "arm64";
+			break;
+		default:
+			throw new Error(formatUnsupportedTargetMessage(`Unsupported architecture: ${arch}`));
+	}
+
+	if (os === "windows") {
+		return `${APP_NAME}-${os}-${archName}.exe`;
+	}
+	return `${APP_NAME}-${os}-${archName}`;
+}
+
+/**
+ * Resolve the path that `gjc` maps to in the user's PATH.
+ */
+function resolveGjcPath(): string | undefined {
+	return $which(APP_NAME) ?? undefined;
+}
+
+/**
+ * Parse the version reported by `gjc --version` ("gjc/X.Y.Z" or a nightly prerelease variant).
+ */
+function parseReportedVersion(output: string): string | undefined {
+	// Output format: "gjc/X.Y.Z" (stable) or "gjc/X.Y.Z-nightly.<ts>.<run>.g<sha>" (nightly prerelease)
+	const match = output.trim().match(/\/(\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?)/);
+	return match?.[1];
+}
+
+export function parseReportedVersionForTest(output: string): string | undefined {
+	return parseReportedVersion(output);
+}
+
+/**
+ * Run the resolved gjc binary and check if it reports the expected version.
+ */
+async function verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification> {
+	const ompPath = resolveGjcPath();
+	if (!ompPath) return { ok: false };
+	try {
+		const result = await $`${ompPath} --version`.quiet().nothrow();
+		if (result.exitCode !== 0) return { ok: false, path: ompPath };
+		const actual = parseReportedVersion(result.text());
+		return { ok: actual === expectedVersion, actual, path: ompPath };
+	} catch {
+		return { ok: false, path: ompPath };
+	}
+}
+
+async function verifyInstalledRuntime(expectedVersion: string): Promise<InstalledVersionVerification> {
+	const versionResult = await verifyInstalledVersion(expectedVersion);
+	if (!versionResult.ok || !versionResult.path) {
+		return versionResult;
+	}
+	try {
+		const smokeResult = await $`${versionResult.path} --smoke-test`.quiet().nothrow();
+		if (smokeResult.exitCode === 0) {
+			return versionResult;
+		}
+		return {
+			...versionResult,
+			ok: false,
+			smokeTestFailed: true,
+			smokeTestOutput: smokeResult.text().trim(),
+		};
+	} catch (error) {
+		return {
+			...versionResult,
+			ok: false,
+			smokeTestFailed: true,
+			smokeTestOutput: error instanceof Error ? error.message : String(error),
+		};
+	}
+}
+
+function printRestartGuidance(): void {
+	console.log(chalk.dim(`Restart ${APP_NAME} to use the new version`));
+}
+
+function printVerifiedVersion(expectedVersion: string): void {
+	console.log(chalk.green(`\n${theme.status.success} Updated to ${expectedVersion}`));
+}
+
+function printSuccessfulVerification(expectedVersion: string): void {
+	printVerifiedVersion(expectedVersion);
+	printRestartGuidance();
+}
+
+function formatBinaryInstallInstruction(platform: NodeJS.Platform = process.platform): string {
+	if (platform === "win32") {
+		return `For a supported binary install, reinstall with PowerShell: irm https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.ps1 | iex`;
+	}
+	return `For a supported binary install, reinstall with: curl -fsSL https://raw.githubusercontent.com/${RELEASE_REPO}/main/scripts/install.sh | sh -s -- --binary`;
+}
+
+function formatManualUpdateInstructions(platform: NodeJS.Platform = process.platform): string {
+	return [
+		`If ${APP_NAME} was installed with Bun, run: bun install -g ${PACKAGE}@latest`,
+		`If ${APP_NAME} was installed with npm, pnpm, or another package manager, update it with that same manager.`,
+		formatBinaryInstallInstruction(platform),
+	].join("\n");
+}
+
+function formatUnsupportedTargetMessage(reason: string, platform: NodeJS.Platform = process.platform): string {
+	return `${reason}.\n${formatManualUpdateInstructions(platform)}`;
+}
+
+function buildReleaseBinaryUrl(
+	version: string,
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string {
+	const binaryName = getBinaryName(platform, arch);
+	const tag = `v${version}`;
+	return `https://github.com/${RELEASE_REPO}/releases/download/${tag}/${binaryName}`;
+}
+
+function formatBinaryDownloadFailureMessage(
+	binaryName: string,
+	url: string,
+	status: string | number,
+	platform: NodeJS.Platform = process.platform,
+	registryNote?: string,
+): string {
+	const note = registryNote ? `\n${registryNote}` : "";
+	return `Download failed for ${binaryName} from ${url}: ${status}.${note}\n${formatManualUpdateInstructions(platform)}`;
+}
+
+export function formatBinaryDownloadFailureMessageForTest(
+	binaryName: string,
+	url: string,
+	status: string | number,
+	platform: NodeJS.Platform = process.platform,
+	registryNote?: string,
+): string {
+	return formatBinaryDownloadFailureMessage(binaryName, url, status, platform, registryNote);
+}
+
+export function buildReleaseBinaryUrlForTest(
+	version: string,
+	platform: NodeJS.Platform = process.platform,
+	arch: string = process.arch,
+): string {
+	return buildReleaseBinaryUrl(version, platform, arch);
+}
+
+export function formatManualUpdateInstructionsForTest(platform: NodeJS.Platform = process.platform): string {
+	return formatManualUpdateInstructions(platform);
+}
+
+function normalizeVerificationOutput(output: string | undefined): string {
+	return output?.replace(/\s+/g, " ").trim() ?? "";
+}
+
+function formatVerificationFailure(result: InstalledVersionVerification, expectedVersion: string): string {
+	if (result.smokeTestFailed) {
+		const output = normalizeVerificationOutput(result.smokeTestOutput);
+		const outputSuffix = output ? `: ${output}` : "";
+		const pathSuffix = result.path ? ` at ${result.path}` : "";
+		return `${APP_NAME}${pathSuffix} reports ${result.actual ?? expectedVersion}, but --smoke-test failed${outputSuffix}. Close running ${APP_NAME} sessions and reinstall to repair a stale or partial update.`;
+	}
+	if (result.actual) {
+		return `${APP_NAME} at ${result.path} still reports ${result.actual} (expected ${expectedVersion})`;
+	}
+	return `could not verify updated version${result.path ? ` at ${result.path}` : ""}`;
+}
+
+export function formatVerificationFailureForTest(
+	result: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	return formatVerificationFailure(result, expectedVersion);
+}
+
+async function unlinkIfExists(filePath: string): Promise<void> {
+	try {
+		await fs.promises.unlink(filePath);
+	} catch (err) {
+		if (!isEnoent(err)) throw err;
+	}
+}
+
+function formatBackupCleanupWarning(backupPath: string, err: unknown): string {
+	return `Installed update, but could not remove backup file ${backupPath}: ${err}. You can delete it manually after closing shells or antivirus processes that may still hold it.`;
+}
+
+async function cleanupVerifiedBackup(backupPath: string): Promise<string | undefined> {
+	try {
+		await unlinkIfExists(backupPath);
+		return undefined;
+	} catch (err) {
+		return formatBackupCleanupWarning(backupPath, err);
+	}
+}
+
+/**
+ * Atomically replace the installed binary and roll back if version verification fails.
+ */
+export async function replaceBinaryForUpdate(options: BinaryReplacementOptions): Promise<InstalledVersionVerification> {
+	let backupReady = false;
+	try {
+		await unlinkIfExists(options.backupPath);
+		await fs.promises.rename(options.targetPath, options.backupPath);
+		backupReady = true;
+		await fs.promises.rename(options.tempPath, options.targetPath);
+
+		const verification = await options.verifyInstalledVersion(options.expectedVersion);
+		if (!verification.ok) {
+			throw new Error(
+				`${formatVerificationFailure(verification, options.expectedVersion)}; restored previous ${APP_NAME} binary`,
+			);
+		}
+
+		backupReady = false;
+		const cleanupWarning = await cleanupVerifiedBackup(options.backupPath);
+		return cleanupWarning ? { ...verification, cleanupWarning } : verification;
+	} catch (err) {
+		if (backupReady) {
+			await unlinkIfExists(options.targetPath);
+			await fs.promises.rename(options.backupPath, options.targetPath);
+		}
+		await unlinkIfExists(options.tempPath);
+		throw err;
+	}
+}
+
+function formatPackageManagerInstallFailure(
+	managerName: string,
+	result: PackageManagerUpdateResult,
+	verification: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	const output = normalizeVerificationOutput(result.text());
+	const outputSuffix = output ? `: ${output}` : "";
+	return `${managerName} install failed with exit code ${result.exitCode ?? "unknown"}${outputSuffix}. ${formatVerificationFailure(verification, expectedVersion)}`;
+}
+
+function formatPackageManagerVerificationFailure(
+	managerName: string,
+	verification: InstalledVersionVerification,
+	expectedVersion: string,
+): string {
+	return `${managerName} install exited successfully, but the selected ${APP_NAME} runtime failed verification: ${formatVerificationFailure(verification, expectedVersion)}`;
+}
+
+export async function runPackageManagerUpdateForTest(
+	options: PackageManagerUpdateOptions,
+): Promise<InstalledVersionVerification> {
+	return updateViaPackageManager(options);
+}
+
+async function updateViaPackageManager(options: PackageManagerUpdateOptions): Promise<InstalledVersionVerification> {
+	const result = await options.runInstall(options.expectedVersion);
+	if (result.exitCode === 0) {
+		const verification = await options.verifyInstalledRuntime(options.expectedVersion);
+		if (!verification.ok) {
+			throw new Error(
+				formatPackageManagerVerificationFailure(options.managerName, verification, options.expectedVersion),
+			);
+		}
+		printSuccessfulVerification(options.expectedVersion);
+		return verification;
+	}
+
+	const verification = await options.verifyInstalledRuntime(options.expectedVersion);
+	if (verification.ok) {
+		console.warn(
+			chalk.yellow(
+				`${options.managerName} exited with ${result.exitCode ?? "unknown"}, but ${APP_NAME} now verifies as ${options.expectedVersion}. Treating the update as installed.`,
+			),
+		);
+		(options.printRecoveredVerification ?? printSuccessfulVerification)(options.expectedVersion);
+		return verification;
+	}
+
+	throw new Error(
+		formatPackageManagerInstallFailure(options.managerName, result, verification, options.expectedVersion),
+	);
+}
+
+/**
+ * Update via bun package manager.
+ */
+async function updateViaBun(expectedVersion: string): Promise<void> {
+	console.log(chalk.dim("Updating via bun..."));
+	await updateViaPackageManager({
+		managerName: "bun",
+		expectedVersion,
+		runInstall: async version => await $`bun install -g ${PACKAGE}@${version}`.nothrow(),
+		verifyInstalledRuntime,
+	});
+}
+
+async function updateViaNpm(packageName: string, expectedVersion: string): Promise<void> {
+	console.log(chalk.dim(`Updating npm-managed install via npm (${packageName})...`));
+	await updateViaPackageManager({
+		managerName: "npm",
+		expectedVersion,
+		runInstall: async version => await $`npm install -g ${packageName}@${version}`.nothrow(),
+		verifyInstalledRuntime,
+	});
+}
+
+/**
+ * Flush a freshly written file's data to stable storage.
+ *
+ * Critical on network filesystems (e.g. NFS home directories): `pipeline`
+ * resolving does not guarantee the downloaded bytes are durable on the
+ * server, so the post-install `gjc --version` check can exec a binary whose
+ * pages are not yet consistent. The child then faults, the version check
+ * fails, and the update is rolled back with "could not verify updated
+ * version" even though the download itself succeeded. Explicitly fsyncing
+ * before the rename/exec avoids the race.
+ */
+async function fsyncFile(filePath: string): Promise<void> {
+	const handle = await fs.promises.open(filePath, "r+");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+export async function fsyncFileForTest(filePath: string): Promise<void> {
+	return fsyncFile(filePath);
+}
+
+/**
+ * Download a release binary to a temp path, throwing a friendly error when the
+ * release asset cannot be fetched.
+ */
+async function downloadBinaryTo(
+	url: string,
+	tempPath: string,
+	binaryName: string,
+	registryNote?: string,
+): Promise<void> {
+	const response = await fetch(url, { redirect: "follow" });
+	if (!response.ok || !response.body) {
+		throw new Error(
+			formatBinaryDownloadFailureMessage(
+				binaryName,
+				url,
+				response.statusText || response.status,
+				process.platform,
+				registryNote,
+			),
+		);
+	}
+	const fileStream = fs.createWriteStream(tempPath, { mode: 0o755 });
+	await pipeline(response.body, fileStream);
+}
+
+/** Injectable steps of the binary update flow (seams for testing ordering). */
+export interface BinaryUpdateFlow {
+	download(url: string, tempPath: string): Promise<void>;
+	fsync(filePath: string): Promise<void>;
+	replace(options: BinaryReplacementOptions): Promise<InstalledVersionVerification>;
+	verifyInstalledVersion(expectedVersion: string): Promise<InstalledVersionVerification>;
+	/** Best-effort cleanup of the temp file when the flow aborts before replace. */
+	removeTemp?(filePath: string): Promise<void>;
+	/** Called once fsync has succeeded, right before replacement begins. */
+	beforeReplace?(): void;
+}
+
+/**
+ * Orchestrate download → fsync → replace → verify with a strict ordering
+ * contract: the downloaded temp binary MUST be flushed to stable storage
+ * before it is published (renamed into place) or exec'd for verification.
+ *
+ * If fsync fails the temp bytes are not durable, so we abort before
+ * replacement/verification and clean up the temp file rather than installing a
+ * possibly-truncated binary.
+ */
+export async function runBinaryUpdateFlow(
+	targetPath: string,
+	url: string,
+	expectedVersion: string,
+	flow: BinaryUpdateFlow,
+): Promise<InstalledVersionVerification> {
+	const tempPath = `${targetPath}.new`;
+	const backupPath = `${targetPath}.bak`;
+
+	await flow.download(url, tempPath);
+	try {
+		await flow.fsync(tempPath);
+	} catch (err) {
+		if (flow.removeTemp) await flow.removeTemp(tempPath);
+		throw err;
+	}
+
+	flow.beforeReplace?.();
+	return flow.replace({
+		targetPath,
+		tempPath,
+		backupPath,
+		expectedVersion,
+		verifyInstalledVersion: flow.verifyInstalledVersion,
+	});
+}
+
+/**
+ * Describe the registry a version came from, when it is not the public one.
+ *
+ * The binary update path downloads from GitHub release tags, so a version that
+ * only exists on a private mirror produces a bare 404 with nothing linking it
+ * back to the registry that named it.
+ */
+function formatRegistryProvenance(version: string, registry: string | undefined): string | undefined {
+	if (!registry || registry === DEFAULT_NPM_REGISTRY) return undefined;
+	return `Version ${version} was resolved from ${registry}, not ${DEFAULT_NPM_REGISTRY}; a version published only to that registry has no matching GitHub release asset.`;
+}
+
+/**
+ * Download a release binary to a target path, replacing an existing file.
+ */
+async function updateViaBinaryAt(targetPath: string, expectedVersion: string, registry?: string): Promise<void> {
+	const binaryName = getBinaryName();
+	const url = buildReleaseBinaryUrl(expectedVersion);
+	const registryNote = formatRegistryProvenance(expectedVersion, registry);
+	console.log(chalk.dim(`Downloading ${binaryName}…`));
+
+	const verification = await runBinaryUpdateFlow(targetPath, url, expectedVersion, {
+		download: (downloadUrl, tempPath) => downloadBinaryTo(downloadUrl, tempPath, binaryName, registryNote),
+		fsync: fsyncFile,
+		replace: replaceBinaryForUpdate,
+		verifyInstalledVersion: verifyInstalledRuntime,
+		removeTemp: unlinkIfExists,
+		beforeReplace: () => console.log(chalk.dim("Installing update...")),
+	});
+
+	printVerifiedVersion(expectedVersion);
+	if (verification.cleanupWarning) console.warn(chalk.yellow(verification.cleanupWarning));
+	printRestartGuidance();
+}
+
+/**
+ * Run the update command.
+ */
+export interface UpdateCommandDependencies {
+	getLatestRelease?: (options?: LatestReleaseLookupOptions) => Promise<ReleaseInfo>;
+	resolveUpdateTarget?: () => Promise<UpdateTarget>;
+	performUpdate?: (target: UpdateTarget, expectedVersion: string, registry?: string) => Promise<void>;
+	refreshInstalledDefaultSkills?: () => Promise<void>;
+	exit?: (code: number) => never;
+}
+
+async function performUpdate(target: UpdateTarget, expectedVersion: string, registry?: string): Promise<void> {
+	if (target.method === "bun") {
+		await updateViaBun(expectedVersion);
+	} else if (target.method === "npm") {
+		await updateViaNpm(target.packageName, expectedVersion);
+	} else {
+		await updateViaBinaryAt(target.path, expectedVersion, registry);
+	}
+}
+
+/** How the update command should proceed after comparing versions. */
+export interface UpdateDecision {
+	install: boolean;
+	kind: "up-to-date" | "new-version" | "switch-back" | "force";
+}
+
+/**
+ * Decide whether to install after comparing the channel's release with the
+ * installed version.
+ *
+ * A nightly install is semver-newer than every stable release (nightlies
+ * version as stable-max-patch+1), so a plain comparison would pin the user on
+ * nightly forever: switching back to stable must install even though the
+ * target is semver-lower. Only a stable lookup from a nightly build is an
+ * intentional switch-back — the reverse (a same-core nightly behind the
+ * installed stable) still requires --force.
+ */
+export function resolveUpdateDecision(options: {
+	comparison: number;
+	force: boolean;
+	channel: UpdateChannel;
+	currentVersion: string;
+}): UpdateDecision {
+	const isChannelSwitchBack =
+		options.channel === "stable" && options.currentVersion.includes("-nightly.") && options.comparison < 0;
+	if (options.comparison <= 0 && !isChannelSwitchBack && !options.force) {
+		return { install: false, kind: "up-to-date" };
+	}
+	if (isChannelSwitchBack) return { install: true, kind: "switch-back" };
+	return { install: true, kind: options.comparison > 0 ? "new-version" : "force" };
+}
+
+export async function runUpdateCommand(
+	opts: UpdateCommandOptions,
+	deps: UpdateCommandDependencies = {},
+): Promise<void> {
+	const channel = opts.channel ?? "stable";
+	const lookupRelease = deps.getLatestRelease ?? getLatestRelease;
+	const resolveTarget = deps.resolveUpdateTarget ?? resolveUpdateTarget;
+	const update = deps.performUpdate ?? performUpdate;
+	const refreshDefaults = deps.refreshInstalledDefaultSkills ?? refreshInstalledDefaultSkills;
+	const exit = deps.exit ?? process.exit;
+
+	console.log(chalk.dim(`Current version: ${VERSION}`));
+	if (channel !== "stable") {
+		console.log(chalk.dim(`Update channel: ${channel} (npm dist-tag ${distTagForChannel(channel)})`));
+	}
+
+	// Resolve the install target first so the registry lookup can match the
+	// manager that will actually run: the npm-managed path ignores
+	// BUN_CONFIG_REGISTRY, so preferring it there would make the version check
+	// disagree with the install this command is gating. Failure is not fatal
+	// here — the later resolveTarget() call reports it.
+	let installer: Installer | undefined;
+	let target: UpdateTarget | undefined;
+	try {
+		target = await resolveTarget();
+		installer = target.method === "bun" ? "bun" : target.method === "npm" ? "npm" : undefined;
+	} catch {
+		installer = undefined;
+	}
+
+	let release: ReleaseInfo;
+	try {
+		release = await lookupRelease({ ...(installer ? { installer } : {}), channel });
+	} catch (err) {
+		console.error(chalk.red(`Failed to check for updates: ${err}`));
+		return exit(1);
+	}
+
+	// A config file that exists but could not be read changes which registry
+	// answered; saying so beats a version that quietly came from somewhere else.
+	// `?? []` because UpdateCommandDependencies is a public seam an untyped
+	// consumer can satisfy without the field.
+	for (const warning of release.warnings ?? []) console.warn(chalk.yellow(`Warning: ${warning}`));
+
+	let comparison: number;
+	try {
+		comparison = compareVersions(release.version, VERSION);
+	} catch (err) {
+		console.error(
+			chalk.red(
+				`Failed to check for updates: the ${distTagForChannel(channel)} channel reported an unparseable version "${release.version}": ${err instanceof Error ? err.message : String(err)}`,
+			),
+		);
+		return exit(1);
+	}
+
+	const decision = resolveUpdateDecision({ comparison, force: opts.force, channel, currentVersion: VERSION });
+
+	if (!decision.install) {
+		console.log(chalk.green(`${theme.status.success} Already up to date`));
+		return;
+	}
+
+	if (decision.kind === "switch-back") {
+		console.log(chalk.cyan(`Switching to the stable channel: ${release.version}`));
+	} else if (decision.kind === "new-version") {
+		console.log(chalk.cyan(`New version available: ${release.version}`));
+	} else {
+		console.log(chalk.yellow(`Forcing reinstall of ${release.version}`));
+	}
+
+	if (opts.check) return;
+
+	try {
+		const resolved = target ?? (await resolveTarget());
+		await update(resolved, release.version, release.registry);
+	} catch (err) {
+		console.error(chalk.red(`Update failed: ${err}`));
+		return exit(1);
+	}
+
+	await refreshDefaults();
+}
+
+/**
+ * Refresh opted-in on-disk default workflow skill copies after a successful
+ * update. The four default skills ship embedded in the binary, so most users
+ * need nothing here. But users who ran `gjc setup defaults` have on-disk copies
+ * under the agent dir that shadow the embedded defaults; those would otherwise
+ * go stale after an update. Only rewrite files that already exist and differ —
+ * never materialize new copies for users who never opted in.
+ */
+async function refreshInstalledDefaultSkills(): Promise<void> {
+	try {
+		const result = await installDefaultGjcDefinitions({ refreshOnly: true });
+		if (result.written > 0) {
+			console.log(
+				chalk.dim(`Refreshed ${result.written} local default workflow skill file(s) at ${result.targetRoot}`),
+			);
+		}
+	} catch (err) {
+		console.error(chalk.yellow(`Warning: failed to refresh local default workflow skills: ${err}`));
+	}
+}
+
+/**
+ * Print update command help.
+ */
+export function printUpdateHelp(): void {
+	console.log(`${chalk.bold(`${APP_NAME} update`)} - Check for and install updates
+
+${chalk.bold("Usage:")}
+  ${APP_NAME} update [options]
+
+${chalk.bold("Options:")}
+  -c, --check               Check for updates without installing
+  -f, --force               Force reinstall even if up to date
+  --channel <stable|nightly>  Release channel to update from (default: stable or startup.updateChannel setting)
+
+${chalk.bold("Examples:")}
+  ${APP_NAME} update                    Update to latest version
+  ${APP_NAME} update --check            Check if updates are available
+  ${APP_NAME} update --force            Force reinstall
+  ${APP_NAME} update --channel nightly  Update to the latest nightly prerelease
+`);
+}
