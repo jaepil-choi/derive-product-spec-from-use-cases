@@ -3,7 +3,7 @@
 이 디렉터리의 하위 레포들은 **git submodule 이 아니라 특정 커밋에서 떠온 정적 스냅샷**입니다.
 자체 harness 를 설계하기 위한 읽기 전용 참고 자료이며, 상류(upstream)를 추적하지 않습니다.
 
-- 스냅샷 시점: 2026-08-17
+- 스냅샷 시점: 2026-08-17 (deepseek-harness 는 2026-08-18 추가)
 - 각 스냅샷은 원본 레포의 `.git` 을 제거한 평범한 파일들로 이 레포에 그대로 커밋되어 있습니다.
 - `.gitattributes` 의 `export-ignore` 로 릴리스 아카이브(`git archive`)에서는 제외됩니다.
 
@@ -13,6 +13,7 @@
 | --- | --- | --- | --- | --- |
 | `references/ouroboros` | https://github.com/Q00/ouroboros.git | `fc774f7b962964f8ed7e559e1c4618f4699a65f7` | `v0.51.4` | 2026-08-14 |
 | `references/gajae-code` | https://github.com/Yeachan-Heo/gajae-code.git | `5666472818b71a1c37615408d9b4d3b5a77b7fa3` | `v0.13.2-1-g566647281` | 2026-08-13 |
+| `references/deepseek-harness` | https://github.com/deepseek-ai/deepseek-harness.git | `99f6f02fecdb7dff40c3fbc9470f5907c29f74ca` | `dsh-v0.1.0-rc.7` | 2026-08-17 |
 
 ## 규칙
 
